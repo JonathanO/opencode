@@ -11,7 +11,7 @@ import {
   TransportError,
   type LLMRequest,
 } from "@opencode/ai/effect"
-import { OpenAIChat } from "@opencode/ai/protocols"
+import { AnthropicMessages, OpenAIChat } from "@opencode/ai/protocols"
 import { TestLLM } from "@opencode/ai/testing"
 import type { StreamOptions } from "@opencode/ai/route"
 import { Agent } from "@opencode/core/agent"
@@ -53,6 +53,7 @@ import { Plugin } from "@opencode/core/plugin"
 import { PluginHooks } from "@opencode/core/plugin/hooks"
 import { PluginSupervisor } from "@opencode/core/plugin/supervisor"
 import { Tool } from "@opencode/core/tool"
+import { Money } from "@opencode/schema/money"
 import { asc, eq } from "drizzle-orm"
 import { Effect, Fiber, Layer, Schema, Stream } from "effect"
 import { TestClock } from "effect/testing"
@@ -64,6 +65,7 @@ let instruction: string | Instructions.Unavailable = "Initial context"
 const sessionID = SessionSchema.ID.make("ses_generate_test")
 
 const model = LanguageModel.make({ id: "generate-model", provider: "test", route: OpenAIChat.route })
+let resolvedModel: LanguageModel = model
 const client = Layer.mock(LLMClient.Service)({
   stream: () => Stream.die(new Error("unused")),
   generate: (request, requestOptions) =>
@@ -89,7 +91,7 @@ const client = Layer.mock(LLMClient.Service)({
 const models = Layer.mock(SessionRunnerModel.Service)({
   resolve: () =>
     Effect.succeed(
-      SessionRunnerModel.resolved(model, {
+      SessionRunnerModel.resolved(resolvedModel, {
         capabilities: { tools: true, input: ["text", "image"], output: ["text"] },
         cost: [],
         limit: { context: 200_000, output: 32_000 },
@@ -206,6 +208,13 @@ const userTexts = (request: LLMRequest) =>
     message.role === "user"
       ? message.content.flatMap((content) => (content.type === "text" ? [content.text] : []))
       : [],
+  )
+
+const cachedTexts = (request: LLMRequest) =>
+  request.messages.flatMap((message) =>
+    message.content.flatMap((content) =>
+      content.type === "text" && content.cache !== undefined ? [`${message.role}: ${content.text}`] : [],
+    ),
   )
 
 const setup = Effect.gen(function* () {
@@ -354,11 +363,63 @@ it.effect(
         ),
       ).toEqual(["Settled partial answer"])
       expect(requests[0]?.tools).toMatchObject([{ name: "lookup", description: "Lookup" }])
+      expect(cachedTexts(requests[0])).toEqual([])
+      expect(requests[0]?.cache).toBeUndefined()
       expect(requests[0]?.toolChoice).toBeUndefined()
       expect(options[0]?.webSocket).toBeUndefined()
       expect(yield* durableState(db, sessionID)).toEqual(before)
     }),
   { timeout: 15_000 },
+)
+
+it.effect("caches the transcript prefix instead of the transient turns", () =>
+  Effect.gen(function* () {
+    requests.length = 0
+    instruction = "Initial context"
+    resolvedModel = LanguageModel.make({ id: "claude-opus-5", provider: "anthropic", route: AnthropicMessages.route })
+    const { db, bus, instructions, session, instances } = yield* setup
+    yield* InstructionState.prepare(db, bus, instructions, sessionID)
+    const existing = SessionMessage.ID.create()
+    yield* bus.publish(SessionEvent.InboxEnqueued, {
+      sessionID,
+      inboxID: existing,
+      item: { type: "user", payload: { text: "Existing durable context" }, delivery: "steer" },
+    })
+    yield* bus.publish(SessionEvent.InboxDelivered, { sessionID, inboxID: existing })
+    const assistant = SessionMessage.ID.create()
+    yield* bus.publish(SessionEvent.Step.Started, {
+      sessionID,
+      assistantMessageID: assistant,
+      agent: Agent.ID.make("build"),
+      model: { id: ID.make("claude-opus-5"), providerID: Provider.ID.make("anthropic") },
+      started: 0,
+    })
+    yield* bus.publish(SessionEvent.Text.Started, { sessionID, assistantMessageID: assistant, ordinal: 0 })
+    yield* bus.publish(SessionEvent.Text.Ended, {
+      sessionID,
+      assistantMessageID: assistant,
+      ordinal: 0,
+      text: "Settled answer",
+    })
+    yield* bus.publish(SessionEvent.Step.Ended, {
+      sessionID,
+      assistantMessageID: assistant,
+      finish: "stop",
+      cost: Money.USD.zero,
+      tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+    })
+    instruction = "Changed context"
+
+    yield* SessionGenerate.generate({ session, prompt: "Keep alive" }).pipe(
+      Effect.provideService(Instance.Service, instances),
+    )
+
+    expect(requests).toHaveLength(1)
+    expect(requests[0]?.messages.map((message) => message.role)).toEqual(["user", "assistant", "system", "user"])
+    // The next step extends the transcript, so the keep-alive prompt and instruction update stay uncached.
+    expect(cachedTexts(requests[0])).toEqual(["assistant: Settled answer"])
+    expect(requests[0]?.cache).toEqual({ tools: true, system: true })
+  }).pipe(Effect.ensuring(Effect.sync(() => (resolvedModel = model)))),
 )
 
 it.effect(

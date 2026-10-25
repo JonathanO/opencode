@@ -207,6 +207,31 @@ export const placesMarkers = (request: LLMRequest) => {
   return Boolean(policy.tools || policy.system || policy.messages)
 }
 
+// Place the message breakpoint at the end of the first `length` messages instead of the conversation tail.
+// For requests that append turns no later request repeats, such as a keep-alive prompt: a tail breakpoint
+// would cache a prefix that nothing extends, while this one reads and refreshes the prefix the next request
+// shares. The request keeps its tool and system breakpoints. System messages are skipped because some
+// protocols move them after the next user turn. A manual hint already on that message is kept. Requests
+// whose policy places no message breakpoints, and requests with no breakpoint budget left, are returned
+// unchanged.
+export const cacheMessagePrefix = (request: LLMRequest, length: number): LLMRequest => {
+  const policy = selectPolicy(request)
+  if (!policy.messages) return request
+  const index = request.messages
+    .slice(0, Math.max(0, length))
+    .findLastIndex((message) => message.role !== "system" && message.content.some(isCacheablePart))
+  const target = request.messages[index]
+  if (target === undefined) return request
+  const ttl = requestTTL(request)
+  const marked = target.content.some((part) => isCacheablePart(part) && part.cache !== undefined)
+  const budget = { remaining: Math.max(0, BREAKPOINT_CAP - countHints(request)) }
+  const messages = marked ? request.messages : markMessageAt(request.messages, index, makeHint(ttl), budget)
+  if (!marked && messages === request.messages) return request
+  // Placements stay explicit, because an object with only `ttl` means automatic placement.
+  const cache = { tools: policy.tools ?? false, system: policy.system ?? false, ...(ttl === undefined ? {} : { ttl }) }
+  return LLMRequest.update(request, { messages, cache })
+}
+
 // A declared cache format overrides the route allowlist and its model-ID heuristics.
 const selectPolicy = (request: LLMRequest): CachePolicyObject => {
   const format = request.model.compatibility?.cacheFormat

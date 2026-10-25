@@ -101,6 +101,17 @@ makes one model call, and discards the response.
 → one model response, discarded
 ```
 
+On providers that use cache breakpoints, such as Anthropic, the request places
+its conversation breakpoint at the end of the session context, before the
+keep-alive prompt. Each warming request then reads and refreshes the cached
+prefix that the next normal request extends, as long as both requests send the
+same tools, system instructions, and messages.
+
+A plugin that changes tools, system instructions, or messages in the `context`
+hook should make the same change in the `generate` hook. Otherwise warming
+requests keep a cache entry that the next normal request can read only up to
+the first difference.
+
 The request does not admit input, add messages to history, or mutate durable
 session state. OpenCode does not dispatch local tool calls or continue a tool
 loop; the default prompt also tells the model not to use tools.

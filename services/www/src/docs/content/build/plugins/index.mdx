@@ -1420,7 +1420,9 @@ differently:
 - `compaction` runs for checkpoint summaries. `messages` is the transcript being summarized; OpenCode appends its
   summary prompt after hooks run. Set `result` to record the compaction yourself and skip the model call; it takes the
   same fields as a completed compaction message.
-- `generate` runs for transient `ctx.session.generate` calls.
+- `generate` runs for transient `ctx.session.generate` calls, including [warming](/warming) requests. `messages` ends
+  with the transient turns: an optional instruction update and the prompt. Keep them last; OpenCode places the
+  conversation cache breakpoint on the messages before them.
 - `title` runs for title generation. It has no `agent` or `tools`. Set `result` to supply the title yourself.
 
 ```ts
@@ -1437,7 +1439,9 @@ await ctx.session.hook("compaction", async (event) => {
 ```
 
 Changes affect only the outgoing model call, not persisted history or configuration. A hook that should apply to
-every request must register for each kind.
+every request must register for each kind. Provider prompt caches match on the exact prefix of tools, system
+instructions, and messages, so a `compaction` or `generate` hook that does not repeat the `context` hook's changes
+reads and refreshes the agent loop's cache only up to the first difference.
 
 Request overrides follow these rules:
 

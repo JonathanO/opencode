@@ -1,7 +1,7 @@
 export * as SessionGenerate from "./generate.js"
 
 import type { FileSystem } from "../filesystem.js"
-import { LLMClient, Message, type AIError } from "@opencode/ai/effect"
+import { LLMClient, Message, cacheMessagePrefix, type AIError } from "@opencode/ai/effect"
 import { Effect } from "effect"
 import { Database } from "../database/database.js"
 import { Instance } from "../instance/service.js"
@@ -44,24 +44,27 @@ export const generate = Effect.fn("SessionGenerate.generate")(function* (input: 
       initial: history.initial,
       messages: history.messages,
     })
+    const transient = [
+      ...(history.instructionUpdate ? [Message.system(history.instructionUpdate)] : []),
+      Message.user(input.prompt),
+    ]
     const prepared = yield* context.request.generate({
       session: selection.session,
       agent: selection.agent.id,
       model,
       tools: selection.tools,
       system: transcript.system,
-      messages: [
-        ...transcript.messages,
-        ...(history.instructionUpdate ? [Message.system(history.instructionUpdate)] : []),
-        Message.user(input.prompt),
-      ],
+      messages: [...transcript.messages, ...transient],
     })
+    // The next Session step extends the transcript, not the transient turns, so cache the transcript. This
+    // lets warming requests refresh the conversation cache that the next step reads.
+    const request = cacheMessagePrefix(prepared.request, prepared.request.messages.length - transient.length)
     yield* Effect.logInfo("sending session generation request", {
       sessionID: selection.session.id,
       providerID: model.ref.providerID,
       modelID: model.ref.id,
     })
-    const response = yield* llm.generate(prepared.request, prepared.options).pipe(ModelRetry.retry)
+    const response = yield* llm.generate(request, prepared.options).pipe(ModelRetry.retry)
     yield* Effect.logInfo("session generation usage diagnostic", { usage: response.usage })
     return response.text
   }).pipe(instances.provide(input.session))

@@ -125,6 +125,7 @@ export type {
   Snapshot as GenerationSnapshot,
   Status as GenerationStatus,
 } from "./generation.js"
+export { cacheMessagePrefix } from "./cache-policy.js"
 export { Tool, ToolFailure, toDefinitions } from "./tool.js"
 export { ToolRuntime } from "./tool-runtime.js"
 export type { DispatchResult as ToolDispatchResult, ToolSettlement } from "./tool-runtime.js"

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { Effect } from "effect"
+import { Effect, Struct } from "effect"
 import { CacheHint, CompactionPart, LLM, Message, ProviderID, ToolCallPart } from "../src/effect.js"
 import { Auth } from "../src/route.js"
 import { compileRequest } from "../src/route/client.js"
@@ -13,12 +13,13 @@ import {
   Meta,
   MiniMax,
   Moonshot,
+  OpenRouter,
   ZAICodingPlan,
 } from "../src/providers.js"
 import * as AnthropicMessages from "../src/protocols/anthropic-messages.js"
 import * as Gemini from "../src/protocols/gemini.js"
 import * as OpenAIChat from "../src/protocols/openai-chat.js"
-import { applyCachePolicy } from "../src/cache-policy.js"
+import { applyCachePolicy, cacheMessagePrefix } from "../src/cache-policy.js"
 import { it } from "./lib/effect.js"
 
 const anthropicModel = AnthropicMessages.route
@@ -481,7 +482,9 @@ describe("applyCachePolicy", () => {
 
       expect(prepared.body).toMatchObject({
         system: [{ type: "text", text: "Sys", cache_control: { type: "ephemeral", ttl: "1h" } }],
-        messages: [{ role: "user", content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral", ttl: "1h" } }] }],
+        messages: [
+          { role: "user", content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral", ttl: "1h" } }] },
+        ],
       })
     }),
   )
@@ -570,5 +573,196 @@ describe("applyCachePolicy", () => {
       cache: "none",
     })
     expect(applyCachePolicy(request)).toBe(request)
+  })
+})
+
+describe("cacheMessagePrefix", () => {
+  type Body = {
+    tools: Array<{ cache_control?: unknown }>
+    system: Array<{ cache_control?: unknown }>
+    messages: Array<{ role: string; content: Array<{ type: string; text?: string; cache_control?: unknown }> }>
+  }
+  const cachedTexts = (body: Body) =>
+    body.messages.flatMap((message) =>
+      message.content.flatMap((part) => (part.cache_control === undefined ? [] : [part.text])),
+    )
+  const keepAlive = (model: LLM.RequestInput["model"], cache?: LLM.RequestInput["cache"]) =>
+    LLM.request({
+      model,
+      system: [
+        { type: "text", text: "Base agent" },
+        { type: "text", text: "Project instructions" },
+      ],
+      tools: [{ name: "t1", description: "t1", inputSchema: { type: "object", properties: {} } }],
+      messages: [
+        Message.user("first user"),
+        Message.assistant("assistant reply"),
+        Message.system("Instruction update"),
+        Message.user("keep-alive"),
+      ],
+      ...(cache === undefined ? {} : { cache }),
+    })
+
+  it.effect("moves the conversation breakpoint from the transient turns to the shared prefix", () =>
+    Effect.gen(function* () {
+      const request = keepAlive(anthropicModel)
+      const prepared = yield* compileRequest(cacheMessagePrefix(request, 2))
+      const body = prepared.body as Body
+
+      expect(body.tools[0]?.cache_control).toEqual({ type: "ephemeral" })
+      expect(body.system.map((part) => part.cache_control)).toEqual([{ type: "ephemeral" }, { type: "ephemeral" }])
+      expect(cachedTexts(body)).toEqual(["assistant reply"])
+    }),
+  )
+
+  it.effect("keeps the breakpoint before the transient turns when an update moves after the prompt", () =>
+    Effect.gen(function* () {
+      const model = AnthropicMessages.route
+        .with({ endpoint: { baseURL: "https://api.anthropic.test/v1/" }, auth: Auth.header("x-api-key", "test") })
+        .model({ id: "claude-opus-5" })
+      const prepared = yield* compileRequest(cacheMessagePrefix(keepAlive(model), 2))
+      const body = prepared.body as Body
+
+      // Native system updates move after the latest user turn, past the keep-alive prompt.
+      expect(body.messages.map((message) => message.role)).toEqual(["user", "assistant", "user", "system"])
+      expect(cachedTexts(body)).toEqual(["assistant reply"])
+    }),
+  )
+
+  it.effect("caches a prefix of the next request", () =>
+    Effect.gen(function* () {
+      const model = AnthropicMessages.route
+        .with({ endpoint: { baseURL: "https://api.anthropic.test/v1/" }, auth: Auth.header("x-api-key", "test") })
+        .model({ id: "claude-opus-5" })
+      const ping = (yield* compileRequest(cacheMessagePrefix(keepAlive(model), 2))).body as Body
+      // The next step persists the instruction update before its user message.
+      const next = (yield* compileRequest(
+        LLM.request({
+          model,
+          system: [
+            { type: "text", text: "Base agent" },
+            { type: "text", text: "Project instructions" },
+          ],
+          tools: [{ name: "t1", description: "t1", inputSchema: { type: "object", properties: {} } }],
+          messages: [
+            Message.user("first user"),
+            Message.assistant("assistant reply"),
+            Message.system("Instruction update"),
+            Message.user("next user"),
+          ],
+        }),
+      )).body as Body
+      const blocks = (body: Body) =>
+        body.messages.flatMap((message) => message.content.map((part) => ({ role: message.role, ...part })))
+      const end = blocks(ping).findLastIndex((block) => block.cache_control !== undefined) + 1
+      const strip = (body: Body) =>
+        blocks(body)
+          .slice(0, end)
+          .map((block) => Struct.omit(block, ["cache_control"]))
+
+      expect(end).toBe(2)
+      expect(strip(ping)).toEqual(strip(next))
+      expect(ping.tools).toEqual(next.tools)
+      expect(ping.system).toEqual(next.system)
+    }),
+  )
+
+  it.effect("places a Bedrock Converse cache point after the shared prefix", () =>
+    Effect.gen(function* () {
+      const prepared = yield* compileRequest(cacheMessagePrefix(keepAlive(bedrockModel), 2))
+      const body = prepared.body as {
+        messages: Array<{ role: string; content: Array<{ text?: string; cachePoint?: unknown }> }>
+      }
+
+      expect(body.messages[1]?.role).toBe("assistant")
+      expect(body.messages[1]?.content.at(-1)).toHaveProperty("cachePoint")
+      expect(body.messages.slice(2).flatMap((message) => message.content.filter((part) => part.cachePoint))).toEqual([])
+    }),
+  )
+
+  test("keeps a manual hint at the end of the prefix and drops the tail breakpoint", () => {
+    const hint = new CacheHint({ type: "ephemeral", ttl: "1h" })
+    const request = LLM.request({
+      model: anthropicModel,
+      messages: [
+        Message.user("first user"),
+        new Message({ role: "assistant", content: [{ type: "text", text: "assistant reply", cache: hint }] }),
+        Message.user("keep-alive"),
+      ],
+    })
+    const prefixed = cacheMessagePrefix(request, 2)
+    const applied = applyCachePolicy(prefixed)
+
+    expect(prefixed.messages).toEqual(request.messages)
+    expect(prefixed.cache).toEqual({ tools: true, system: true })
+    expect(applied.messages[1]?.content[0]).toHaveProperty("cache", hint)
+    expect(applied.messages[2]?.content[0]).not.toHaveProperty("cache")
+  })
+
+  test("keeps the policy's tool, system and TTL choices", () => {
+    const request = keepAlive(anthropicModel, { system: true, messages: { tail: 1 }, ttl: "1h" })
+    const prefixed = cacheMessagePrefix(request, 2)
+
+    expect(prefixed.cache).toEqual({ tools: false, system: true, ttl: "1h" })
+    expect(prefixed.messages[1]?.content[0]).toHaveProperty("cache", { type: "ephemeral", ttl: "1h" })
+    expect(prefixed.messages[3]?.content[0]).not.toHaveProperty("cache")
+  })
+
+  test("keeps automatic tool and system placement when only a TTL is configured", () => {
+    const prefixed = cacheMessagePrefix(keepAlive(anthropicModel, { ttl: "1h" }), 2)
+    const applied = applyCachePolicy(prefixed)
+
+    expect(prefixed.cache).toEqual({ tools: true, system: true, ttl: "1h" })
+    expect(applied.tools[0]).toHaveProperty("cache", { type: "ephemeral", ttl: "1h" })
+    expect(applied.messages[1]?.content[0]).toHaveProperty("cache", { type: "ephemeral", ttl: "1h" })
+    expect(applied.messages[3]?.content[0]).not.toHaveProperty("cache")
+  })
+
+  test("keeps placement explicit when the policy marks only messages", () => {
+    const prefixed = cacheMessagePrefix(keepAlive(anthropicModel, { messages: { tail: 1 } }), 2)
+    const applied = applyCachePolicy(prefixed)
+
+    expect(prefixed.cache).toEqual({ tools: false, system: false })
+    expect(
+      applied.messages.flatMap((message) => message.content.filter((part) => "cache" in part && part.cache)),
+    ).toHaveLength(1)
+    expect(applied.messages[3]?.content[0]).not.toHaveProperty("cache")
+  })
+
+  test("skips system messages at the end of the prefix", () => {
+    const prefixed = cacheMessagePrefix(keepAlive(anthropicModel), 3)
+
+    expect(prefixed.messages[1]?.content[0]).toHaveProperty("cache", { type: "ephemeral" })
+    expect(prefixed.messages[2]?.content[0]).not.toHaveProperty("cache")
+  })
+
+  test("returns requests whose policy places no message breakpoints unchanged", () => {
+    const requests = [
+      keepAlive(openaiModel),
+      keepAlive(geminiModel),
+      keepAlive(OpenRouter.configure({ apiKey: "test" }).model("google/gemini-2.5-flash")),
+      keepAlive(anthropicModel, "none"),
+      keepAlive(anthropicModel, { tools: true, system: true }),
+    ]
+
+    requests.forEach((request) => expect(cacheMessagePrefix(request, 2)).toBe(request))
+  })
+
+  test("returns the request unchanged without a prefix or breakpoint budget", () => {
+    const request = keepAlive(anthropicModel)
+    const hint = new CacheHint({ type: "ephemeral" })
+    const full = LLM.request({
+      model: anthropicModel,
+      system: [
+        { type: "text", text: "a", cache: hint },
+        { type: "text", text: "b", cache: hint },
+        { type: "text", text: "c", cache: hint },
+        { type: "text", text: "d", cache: hint },
+      ],
+      messages: [Message.user("first user"), Message.assistant("assistant reply"), Message.user("keep-alive")],
+    })
+
+    expect(cacheMessagePrefix(request, 0)).toBe(request)
+    expect(cacheMessagePrefix(full, 2)).toBe(full)
   })
 })
