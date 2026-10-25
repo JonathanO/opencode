@@ -78,6 +78,10 @@ finishes, the next idle interval starts, but the active window is not extended.
 00:30  warming stops
 ```
 
+Subagent sessions and archived sessions are not warmed. Archiving a session
+stops its warming. After you unarchive it, the next non-warming request starts
+warming again.
+
 Any new non-warming model activity resets both timers. If the interval is as
 long as or longer than the duration, the active window expires before a warming
 request is sent.

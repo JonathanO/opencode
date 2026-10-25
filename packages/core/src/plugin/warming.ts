@@ -44,6 +44,13 @@ export const Plugin = define({
           return
         }
 
+        // Archiving or removing a session ends its warming window.
+        const session = yield* ctx.session.get({ sessionID }).pipe(Effect.orElseSucceed(() => undefined))
+        if (!session || session.time.archived) {
+          sessions.delete(sessionID)
+          return
+        }
+
         const last = current.last
         yield* Effect.logInfo("warming session", { sessionID, last })
         yield* ctx.session
@@ -58,7 +65,7 @@ export const Plugin = define({
     const hook = (event: SessionHooks["context"]) =>
       Effect.gen(function* () {
         const session = yield* ctx.session.get({ sessionID: event.sessionID }).pipe(Effect.orDie)
-        if (session.parentID) return
+        if (session.parentID || session.time.archived) return
 
         const active = sessions.get(event.sessionID)
         const settings = yield* loadSettings()
